@@ -1,10 +1,15 @@
 // Package player drives external mpv for playback. The fullscreen path hands the
-// whole terminal to mpv (via Bubble Tea's ExecProcess); the embedded path (M2)
-// uses mpv for audio only while lazytik renders frames itself.
+// whole terminal to mpv (via Bubble Tea's ExecProcess); the embedded path uses mpv
+// for audio only (controllable over an IPC socket) while lazytik renders frames.
 package player
 
 import (
+	"fmt"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"time"
 
 	"github.com/naimroslan/lazytik/internal/scraper"
 )
@@ -35,16 +40,65 @@ func FullscreenCmd(mpv, vo string, v scraper.Video) *exec.Cmd {
 	)
 }
 
-// AudioFileCmd builds an mpv invocation that plays only the audio of a local
-// file on a loop, alongside lazytik's own frame rendering in the embedded pane.
-// The file is the one lazytik already downloaded, so audio and video share a
-// source and need no second network fetch.
-func AudioFileCmd(mpv, path string) *exec.Cmd {
-	return exec.Command(mpv,
+// Audio is a looping, audio-only mpv playing the already-downloaded clip,
+// controllable over an IPC socket so it can pause in lock-step with the video.
+type Audio struct {
+	cmd  *exec.Cmd
+	sock string
+}
+
+var audioSeq int // disambiguates socket names within one process
+
+// StartAudio launches audio-only mpv for a local file with an IPC server, so the
+// embedded video pane can pause/resume it. Best-effort: on a headless box with no
+// sound device mpv simply produces nothing; video still renders.
+func StartAudio(mpv, path string) (*Audio, error) {
+	audioSeq++
+	sock := filepath.Join(os.TempDir(), fmt.Sprintf("lazytik-audio-%d-%d.sock", os.Getpid(), audioSeq))
+	cmd := exec.Command(mpv,
 		"--no-video",
 		"--loop-file=inf",
 		"--really-quiet",
 		"--no-terminal", // detached: lazytik's TUI owns stdin/stdout
+		"--input-ipc-server="+sock,
 		path,
 	)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &Audio{cmd: cmd, sock: sock}, nil
+}
+
+// pauseCommand is the mpv JSON IPC line to set the pause property.
+func pauseCommand(paused bool) []byte {
+	return []byte(fmt.Sprintf(`{"command":["set_property","pause",%t]}`+"\n", paused))
+}
+
+// SetPaused pauses or resumes audio over the IPC socket. Best-effort: errors
+// (socket not yet ready, already gone) are ignored. Safe on a nil receiver.
+func (a *Audio) SetPaused(paused bool) {
+	if a == nil || a.sock == "" {
+		return
+	}
+	conn, err := net.DialTimeout("unix", a.sock, 300*time.Millisecond)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
+	_, _ = conn.Write(pauseCommand(paused))
+}
+
+// Close stops mpv and removes its socket. Safe on a nil receiver.
+func (a *Audio) Close() {
+	if a == nil {
+		return
+	}
+	if a.cmd != nil && a.cmd.Process != nil {
+		_ = a.cmd.Process.Kill()
+		_ = a.cmd.Wait()
+	}
+	if a.sock != "" {
+		_ = os.Remove(a.sock)
+	}
 }

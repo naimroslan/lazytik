@@ -5,11 +5,12 @@ package tui
 import (
 	"context"
 	"os"
-	"os/exec"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/naimroslan/lazytik/internal/player"
 	"github.com/naimroslan/lazytik/internal/render"
 	"github.com/naimroslan/lazytik/internal/scraper"
 )
@@ -38,22 +39,23 @@ type Model struct {
 	width  int
 	height int
 
-	loading bool
-	paused  bool
-	status  string // transient status / error line
+	loading      bool
+	spinnerFrame int
+	paused       bool
+	status       string // transient status / error line
 
 	// Embedded playback state for the focused video.
-	gen     int             // playback epoch; bumped whenever playback (re)starts
-	dec     *render.Decoder // current ffmpeg decoder, nil when not playing
-	audio   *exec.Cmd       // current mpv audio process, nil when not playing
-	tmpFile string          // downloaded clip backing dec/audio, removed on stop
-	frame   string          // latest rendered frame for the current video
+	gen   int             // playback epoch; bumped whenever playback (re)starts
+	dec   *render.Decoder // current ffmpeg decoder, nil when not playing
+	audio *player.Audio   // current mpv audio, nil when not playing
+	frame string          // latest rendered frame for the current video
 
-	// Prefetch: the next clip is downloaded in the background while the current
-	// one plays, so scrolling down is instant.
-	prefetched  map[string]string // videoID -> ready temp file (the next clip)
-	prefetching map[string]bool   // videoID -> download in flight
+	// Download cache + prefetch: keep clips for a window of indices around the
+	// current one so scrolling to neighbours (and back) is instant.
+	files       map[string]string // videoID -> downloaded local file
+	downloading map[string]bool   // videoID -> download in flight
 	noVideoIDs  map[string]bool   // videoID -> known to have no video stream
+	navSeq      int               // navigation epoch, for debouncing fast scroll
 }
 
 // New builds a Model that will load its feed asynchronously on Init.
@@ -66,35 +68,46 @@ func New(cfg Config) Model {
 		renderer:    render.For(cfg.Render),
 		loading:     true,
 		status:      "loading feed…",
-		prefetched:  map[string]string{},
-		prefetching: map[string]bool{},
+		files:       map[string]string{},
+		downloading: map[string]bool{},
 		noVideoIDs:  map[string]bool{},
 	}
 }
 
-// Init kicks off the initial feed load.
+// Init kicks off the initial feed load and the loading spinner.
 func (m Model) Init() tea.Cmd {
-	return m.loadFeedCmd()
+	return tea.Batch(m.loadFeedCmd(), spinnerTick())
 }
 
-// loadFeedCmd fetches every configured source and concatenates the results.
+// loadFeedCmd fetches every configured source concurrently and mixes the results.
 func (m Model) loadFeedCmd() tea.Cmd {
 	cfg := m.cfg
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
-		var lists [][]scraper.Video
-		var lastErr error
-		for _, src := range cfg.Sources {
-			vids, err := scraper.ListFeed(ctx, cfg.Ytdlp, src, cfg.Limit)
-			if err != nil {
-				lastErr = err
-				continue // a bad source shouldn't sink the whole mix
-			}
-			lists = append(lists, vids)
+		lists := make([][]scraper.Video, len(cfg.Sources))
+		errs := make([]error, len(cfg.Sources))
+		var wg sync.WaitGroup
+		for i, src := range cfg.Sources {
+			wg.Add(1)
+			go func(i int, src string) {
+				defer wg.Done()
+				lists[i], errs[i] = scraper.ListFeed(ctx, cfg.Ytdlp, src, cfg.Limit)
+			}(i, src)
 		}
-		all := mixFeed(lists, cfg.Shuffle)
+		wg.Wait()
+
+		var ok [][]scraper.Video
+		var lastErr error
+		for i, l := range lists {
+			if errs[i] != nil {
+				lastErr = errs[i] // a bad source shouldn't sink the whole mix
+				continue
+			}
+			ok = append(ok, l)
+		}
+		all := mixFeed(ok, cfg.Shuffle)
 		if len(all) == 0 && lastErr != nil {
 			return scrapeErrMsg{lastErr}
 		}
@@ -110,29 +123,23 @@ func (m Model) current() (scraper.Video, bool) {
 	return m.feed[m.index], true
 }
 
-// stopPlayback tears down the current decoder and audio process, if any.
+// stopPlayback tears down the current decoder and audio, leaving the cached files
+// in place so navigating back is instant.
 func (m *Model) stopPlayback() {
 	if m.dec != nil {
 		_ = m.dec.Close()
 		m.dec = nil
 	}
-	if m.audio != nil && m.audio.Process != nil {
-		_ = m.audio.Process.Kill()
-		_ = m.audio.Wait()
-		m.audio = nil
-	}
-	if m.tmpFile != "" {
-		_ = os.Remove(m.tmpFile)
-		m.tmpFile = ""
-	}
+	m.audio.Close()
+	m.audio = nil
 	m.frame = ""
 }
 
-// cleanupAll tears down playback and removes every prefetched file. Called on quit.
+// cleanupAll tears down playback and removes every cached file. Called on quit.
 func (m *Model) cleanupAll() {
 	m.stopPlayback()
-	for id, p := range m.prefetched {
+	for id, p := range m.files {
 		_ = os.Remove(p)
-		delete(m.prefetched, id)
+		delete(m.files, id)
 	}
 }

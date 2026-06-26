@@ -19,6 +19,9 @@ var (
 	placeholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Align(lipgloss.Center)
 )
 
+// spinnerFrames is a braille spinner shown while the feed loads.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
 // View implements tea.Model.
 func (m Model) View() string {
 	if m.width == 0 {
@@ -29,7 +32,7 @@ func (m Model) View() string {
 	if !ok {
 		msg := m.status
 		if m.loading {
-			msg = "loading feed…"
+			msg = spinnerFrames[m.spinnerFrame%len(spinnerFrames)] + " loading feed…"
 		} else if msg == "" {
 			msg = "no videos in feed"
 		}

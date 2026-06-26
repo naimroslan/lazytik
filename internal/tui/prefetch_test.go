@@ -3,78 +3,92 @@ package tui
 import (
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"github.com/naimroslan/lazytik/internal/scraper"
 )
 
-// feed ids are "a" (index 0) and "b" (index 1) from testFeed().
+// feed ids "a" (0) and "b" (1) come from testFeed(); helpers vids/send/loaded
+// live in feed_test.go / model_test.go.
 
-func TestPrefetchedFileUsedAndConsumed(t *testing.T) {
-	m := loaded()
-	m.prefetched["b"] = "/tmp/lazytik-fake-b.mp4"
-	// Scroll down to "b"; startCurrent should consume the prefetched entry.
-	m = send(m, tea.KeyMsg{Type: tea.KeyDown})
-	if _, ok := m.prefetched["b"]; ok {
-		t.Error("prefetched entry for current video should be consumed (deleted)")
+func TestWindowIDs(t *testing.T) {
+	m := Model{feed: vids("0", "1", "2", "3", "4"), index: 2}
+	w := m.windowIDs() // offsets -1,0,1,2 → indices 1,2,3,4
+	want := map[string]bool{"1": true, "2": true, "3": true, "4": true}
+	if len(w) != len(want) {
+		t.Fatalf("window size %d, want %d: %v", len(w), len(want), w)
+	}
+	for id := range want {
+		if !w[id] {
+			t.Errorf("window missing %q", id)
+		}
+	}
+	if w["0"] {
+		t.Error("index 0 is outside the window at index 2 and should be excluded")
 	}
 }
 
-func TestPrefetchDoneStoresForUpcoming(t *testing.T) {
-	m := loaded() // index 0; upcoming is "b"
-	m.prefetching["b"] = true
-	m = send(m, prefetchDoneMsg{videoID: "b", path: "/tmp/lazytik-b.mp4"})
-	if m.prefetched["b"] != "/tmp/lazytik-b.mp4" {
-		t.Errorf("expected prefetched[b] stored, got %q", m.prefetched["b"])
+func newTestModel(ids ...string) Model {
+	m := New(Config{})
+	m.feed = vids(ids...)
+	m.width, m.height = 0, 0 // keep startCurrent a no-op (no real decode in tests)
+	return m
+}
+
+func TestDownloadDoneCachesNeighbourInWindow(t *testing.T) {
+	m := newTestModel("a", "b", "c") // current = a (index 0); b is in window
+	m.downloading["b"] = true
+	m = send(m, downloadDoneMsg{videoID: "b", path: "/tmp/lazytik-b.mp4"})
+	if m.files["b"] != "/tmp/lazytik-b.mp4" {
+		t.Errorf("expected b cached, got %q", m.files["b"])
 	}
-	if m.prefetching["b"] {
-		t.Error("prefetching flag should be cleared when done")
+	if m.downloading["b"] {
+		t.Error("downloading flag should be cleared")
 	}
 }
 
-func TestPrefetchDoneDiscardsStale(t *testing.T) {
-	m := loaded() // index 0; upcoming is "b", not "zzz"
-	m = send(m, prefetchDoneMsg{videoID: "zzz", path: "/tmp/lazytik-zzz.mp4"})
-	if _, ok := m.prefetched["zzz"]; ok {
-		t.Error("a download that is no longer the upcoming video must be discarded")
+func TestDownloadDoneOutOfWindowDiscarded(t *testing.T) {
+	m := newTestModel("a", "b", "c", "d", "e") // window at 0 = {a,b,c}
+	m = send(m, downloadDoneMsg{videoID: "e", path: "/tmp/lazytik-e.mp4"})
+	if _, ok := m.files["e"]; ok {
+		t.Error("a clip outside the window must not be cached")
 	}
 }
 
-func TestPrefetchNoVideoMarksSkip(t *testing.T) {
-	m := loaded()
-	m.prefetching["b"] = true
-	m = send(m, prefetchDoneMsg{videoID: "b", err: scraper.ErrNoVideo})
+func TestDownloadDoneNoVideoMarks(t *testing.T) {
+	m := newTestModel("a", "b", "c")
+	m.downloading["b"] = true
+	m = send(m, downloadDoneMsg{videoID: "b", err: scraper.ErrNoVideo})
 	if !m.noVideoIDs["b"] {
-		t.Error("ErrNoVideo during prefetch should record the id as video-less")
+		t.Error("ErrNoVideo should record the id as video-less")
 	}
 }
 
-func TestEvictPrefetchExcept(t *testing.T) {
-	m := loaded()
-	m.prefetched["keep"] = "/tmp/keep.mp4"
-	m.prefetched["drop"] = "/tmp/drop.mp4"
-	m.evictPrefetchExcept("keep")
-	if _, ok := m.prefetched["keep"]; !ok {
-		t.Error("keep should remain")
+func TestNavSettledStaleIgnored(t *testing.T) {
+	m := loaded() // sized + fed; startCurrent already bumped gen
+	m.navSeq = 5
+	before := m.gen
+	m = send(m, navSettledMsg{seq: 3}) // stale (≠ navSeq)
+	if m.gen != before {
+		t.Errorf("stale navSettled should be ignored; gen changed %d→%d", before, m.gen)
 	}
-	if _, ok := m.prefetched["drop"]; ok {
-		t.Error("drop should be evicted")
+	m = send(m, navSettledMsg{seq: 5}) // current → starts, bumps gen
+	if m.gen == before {
+		t.Error("matching navSettled should start playback (bump gen)")
 	}
 }
 
-func TestMaybePrefetchNextMarksInFlight(t *testing.T) {
-	m := loaded() // index 0; next is "b"
-	m, cmd := m.maybePrefetchNext()
-	if !m.prefetching["b"] {
-		t.Error("maybePrefetchNext should mark the next video as in-flight")
+func TestPrefetchWindowMarksNeighbours(t *testing.T) {
+	m := newTestModel("a", "b", "c", "d")
+	m.index = 1 // window neighbours: c(+1)... a(-1), d(+2)
+	m2, cmds := m.prefetchWindow()
+	if len(cmds) == 0 {
+		t.Fatal("expected prefetch commands for neighbours")
 	}
-	if cmd == nil {
-		t.Error("expected a prefetch command for the next video")
+	for _, id := range []string{"a", "c", "d"} {
+		if !m2.downloading[id] {
+			t.Errorf("neighbour %q should be marked downloading", id)
+		}
 	}
-	// Calling again must not re-issue while in flight.
-	m2, cmd2 := m.maybePrefetchNext()
-	if cmd2 != nil {
-		t.Error("should not prefetch again while already in flight")
+	if m2.downloading["b"] {
+		t.Error("the current video b should not be prefetched as a neighbour")
 	}
-	_ = m2
 }

@@ -3,7 +3,7 @@ package tui
 import (
 	"errors"
 	"os"
-	"os/exec"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -11,17 +11,26 @@ import (
 	"github.com/naimroslan/lazytik/internal/scraper"
 )
 
+// navDebounce delays playback start after a scroll, so flicking through several
+// videos only loads the one the user lands on.
+const navDebounce = 180 * time.Millisecond
+
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// Ignore duplicate size events (terminals resend them); only a real
-		// change should restart playback to refit the pane.
 		if msg.Width == m.width && msg.Height == m.height {
-			return m, nil
+			return m, nil // terminals resend identical sizes
 		}
 		m.width, m.height = msg.Width, msg.Height
 		return m.startCurrent()
+
+	case spinnerTickMsg:
+		if !m.loading {
+			return m, nil
+		}
+		m.spinnerFrame++
+		return m, spinnerTick()
 
 	case feedLoadedMsg:
 		m.feed = msg.videos
@@ -41,28 +50,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "error: " + msg.err.Error()
 		return m, nil
 
+	case downloadDoneMsg:
+		return m.handleDownloadDone(msg)
+
 	case playbackStartedMsg:
-		// Discard a start that belongs to a video we've already scrolled past.
-		if msg.gen != m.gen {
-			_ = msg.dec.Close()
-			killAudio(msg.audio)
-			if msg.tmpPath != "" {
-				_ = os.Remove(msg.tmpPath)
+		if msg.gen != m.gen { // scrolled on already
+			if msg.dec != nil {
+				_ = msg.dec.Close()
 			}
+			msg.audio.Close()
 			return m, nil
-		}
-		if msg.noVideo {
-			// Photo/slideshow post with no video — skip to the next one.
-			return m.skipForward("no video in this post")
 		}
 		if msg.err != nil {
 			m.status = "playback error: " + msg.err.Error()
 			return m, nil
 		}
-		m.dec, m.audio, m.tmpFile = msg.dec, msg.audio, msg.tmpPath
+		m.dec, m.audio = msg.dec, msg.audio
 		m.status = ""
-		m, pf := m.maybePrefetchNext()
-		return m, tea.Batch(m.nextFrameCmd(m.gen, m.dec), pf)
+		return m, m.nextFrameCmd(m.gen, m.dec)
 
 	case frameReadyMsg:
 		if msg.gen != m.gen {
@@ -78,13 +83,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.gen != m.gen {
 			return m, nil // stale decoder we already replaced
 		}
-		// If ffmpeg exited after producing frames (its own -stream_loop didn't
-		// re-engage, e.g. for HLS), loop by restarting the decoder on the same
-		// downloaded file. The frames>0 guard avoids spinning on a broken clip.
-		if !m.paused && m.tmpFile != "" && m.dec != nil && m.dec.Frames() > 0 {
+		// ffmpeg exited after producing frames (its -stream_loop didn't re-engage,
+		// e.g. HLS) → loop by restarting the decoder on the same cached file. The
+		// frames>0 guard avoids spinning on a broken clip.
+		cur, ok := m.current()
+		if ok && !m.paused && m.dec != nil && m.dec.Frames() > 0 && m.files[cur.ID] != "" {
 			cols, rows := m.paneCells()
 			wPx, hPx := m.renderer.CellSize(cols, rows)
-			path := m.tmpFile
+			path := m.files[cur.ID]
 			_ = m.dec.Close()
 			m.dec = nil
 			return m, m.restartDecodeCmd(m.gen, path, wPx, hPx)
@@ -108,33 +114,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dec = msg.dec
 		return m, m.nextFrameCmd(m.gen, m.dec)
 
-	case prefetchDoneMsg:
-		delete(m.prefetching, msg.videoID)
-		if msg.err != nil {
-			if errors.Is(msg.err, scraper.ErrNoVideo) {
-				m.noVideoIDs[msg.videoID] = true
-			}
-			return m, nil
+	case navSettledMsg:
+		if msg.seq != m.navSeq {
+			return m, nil // superseded by a later scroll
 		}
-		// Keep it only if it's still the upcoming video; otherwise discard.
-		if ni := m.index + 1; ni < len(m.feed) && m.feed[ni].ID == msg.videoID {
-			m.prefetched[msg.videoID] = msg.path
-		} else {
-			os.Remove(msg.path)
-		}
-		return m, nil
+		return m.startCurrent()
 
 	case playbackEndedMsg:
 		if msg.err != nil {
 			m.status = "playback error: " + msg.err.Error()
 		}
-		// Resume embedded playback after returning from a fullscreen handoff.
-		return m.startCurrent()
+		return m.startCurrent() // resume embedded after fullscreen handoff
 
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 
+	return m, nil
+}
+
+// handleDownloadDone records a finished download and, if it's the focused video
+// that's waiting to play, starts it.
+func (m Model) handleDownloadDone(msg downloadDoneMsg) (tea.Model, tea.Cmd) {
+	delete(m.downloading, msg.videoID)
+	cur, hasCur := m.current()
+
+	if msg.err != nil {
+		if errors.Is(msg.err, scraper.ErrNoVideo) {
+			m.noVideoIDs[msg.videoID] = true
+			if hasCur && cur.ID == msg.videoID {
+				return m.skipForward("no video in this post")
+			}
+		} else if hasCur && cur.ID == msg.videoID {
+			m.status = "download failed: " + msg.err.Error()
+		}
+		return m, nil
+	}
+
+	// Cache it only if still in the window; otherwise it's already stale.
+	if m.windowIDs()[msg.videoID] {
+		m.files[msg.videoID] = msg.path
+	} else {
+		_ = os.Remove(msg.path)
+	}
+	// If this is the focused clip and nothing is playing yet, play it now.
+	if hasCur && cur.ID == msg.videoID && m.dec == nil {
+		return m.startCurrent()
+	}
 	return m, nil
 }
 
@@ -146,18 +172,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "down", "j":
 		m = m.move(1)
-		return m.startCurrent()
+		m.navSeq++
+		return m, navTick(m.navSeq)
 
 	case "up", "k":
 		m = m.move(-1)
-		return m.startCurrent()
+		m.navSeq++
+		return m, navTick(m.navSeq)
 
 	case " ":
 		m.paused = !m.paused
+		audio, paused := m.audio, m.paused
+		setPause := func() tea.Msg { audio.SetPaused(paused); return nil }
 		if !m.paused && m.dec != nil {
-			return m, m.nextFrameCmd(m.gen, m.dec) // resume
+			return m, tea.Batch(setPause, m.nextFrameCmd(m.gen, m.dec)) // resume
 		}
-		return m, nil
+		return m, setPause
 
 	case "enter":
 		return m.playFullscreen()
@@ -165,8 +195,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// navTick fires navSettledMsg after the debounce window for the given epoch.
+func navTick(seq int) tea.Cmd {
+	return tea.Tick(navDebounce, func(time.Time) tea.Msg { return navSettledMsg{seq} })
+}
+
+// spinnerTick advances the loading spinner ~8x/second.
+func spinnerTick() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg { return spinnerTickMsg{} })
+}
+
 // move shifts the focused index by delta (clamped, no wrap) and tears down the
-// current playback so the new video starts cleanly.
+// current playback (cached files are kept) so the new video starts cleanly.
 func (m Model) move(delta int) Model {
 	if len(m.feed) == 0 {
 		return m
@@ -209,12 +249,4 @@ func (m Model) playFullscreen() (tea.Model, tea.Cmd) {
 	return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return playbackEndedMsg{err}
 	})
-}
-
-// killAudio stops a detached audio process, tolerating nil.
-func killAudio(c *exec.Cmd) {
-	if c != nil && c.Process != nil {
-		_ = c.Process.Kill()
-		_ = c.Wait()
-	}
 }

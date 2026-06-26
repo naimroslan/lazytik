@@ -2,9 +2,7 @@ package tui
 
 import (
 	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,8 +19,11 @@ const chromeRows = 6
 // kittyMaxFPS caps the frame rate for the kitty backend: each frame is a whole
 // (compressed) image, so a high rate can't be sustained over a link and the
 // video falls into slow motion. Half-blocks (cheap text) keep the full rate.
-// Pair this with the small kittyCell* decode size to bound the per-frame bytes.
 const kittyMaxFPS = 15
+
+// windowOffsets are the indices, relative to the current one, whose clips are
+// kept downloaded: one back and two forward. Prefetch order favours the next.
+var windowOffsets = []int{1, -1, 2, 0}
 
 // decodeFPS is the frame rate to decode at for the active renderer.
 func (m Model) decodeFPS() int {
@@ -33,8 +34,7 @@ func (m Model) decodeFPS() int {
 }
 
 // paneCells returns the size, in character cells, of the video pane's content
-// area. Shared by the view (to draw) and playback (to size the decoder) so the
-// rendered frame always fits.
+// area. Shared by the view (to draw) and playback (to size the decoder).
 func (m Model) paneCells() (cols, rows int) {
 	cols = m.width - 2 // pane border columns
 	if cols < 10 {
@@ -47,10 +47,22 @@ func (m Model) paneCells() (cols, rows int) {
 	return cols, rows
 }
 
-// startCurrent (re)starts embedded playback of the focused video at the current
-// pane size. It is a no-op in fullscreen mode or before the terminal size and
-// feed are known. It bumps the playback epoch so older frames are discarded, and
-// uses a prefetched file when one is ready (instant) instead of downloading.
+// windowIDs returns the set of video ids within the cache window around index i.
+func (m Model) windowIDs() map[string]bool {
+	ids := make(map[string]bool, len(windowOffsets))
+	for _, off := range windowOffsets {
+		j := m.index + off
+		if j >= 0 && j < len(m.feed) {
+			ids[m.feed[j].ID] = true
+		}
+	}
+	return ids
+}
+
+// startCurrent (re)starts embedded playback of the focused video: instantly from
+// the download cache when possible, otherwise it kicks off a download (showing
+// "buffering…") and plays once it arrives. It also evicts out-of-window clips and
+// prefetches neighbours. No-op in fullscreen mode or before size+feed are known.
 func (m Model) startCurrent() (Model, tea.Cmd) {
 	if m.cfg.Fullscreen {
 		return m, nil
@@ -59,7 +71,6 @@ func (m Model) startCurrent() (Model, tea.Cmd) {
 	if !ok || m.width == 0 {
 		return m, nil
 	}
-	// Prefetch already discovered this post has no video — skip it instantly.
 	if m.noVideoIDs[cur.ID] {
 		return m.skipForward("no video in this post")
 	}
@@ -67,15 +78,52 @@ func (m Model) startCurrent() (Model, tea.Cmd) {
 	m.stopPlayback()
 	m.gen++
 	m.paused = false
+	m.evictOutsideWindow()
 
-	cols, rows := m.paneCells()
-	wPx, hPx := m.renderer.CellSize(cols, rows)
-
-	if path, ok := m.prefetched[cur.ID]; ok {
-		delete(m.prefetched, cur.ID)
-		return m, m.startFromFileCmd(m.gen, path, wPx, hPx)
+	var cmds []tea.Cmd
+	if path, ok := m.files[cur.ID]; ok {
+		cols, rows := m.paneCells()
+		wPx, hPx := m.renderer.CellSize(cols, rows)
+		cmds = append(cmds, m.startFromFileCmd(m.gen, path, wPx, hPx))
+	} else if !m.downloading[cur.ID] {
+		m.downloading[cur.ID] = true
+		cmds = append(cmds, downloadCmd(m.cfg, cur.ID, cur.PageURL))
 	}
-	return m, m.startPlaybackCmd(m.gen, cur, wPx, hPx)
+	m, pf := m.prefetchWindow()
+	return m, tea.Batch(append(cmds, pf...)...)
+}
+
+// prefetchWindow starts background downloads for window neighbours not already
+// cached, in flight, or known video-less. Returns the model with those marked.
+func (m Model) prefetchWindow() (Model, []tea.Cmd) {
+	var cmds []tea.Cmd
+	for _, off := range windowOffsets {
+		if off == 0 {
+			continue
+		}
+		j := m.index + off
+		if j < 0 || j >= len(m.feed) {
+			continue
+		}
+		v := m.feed[j]
+		if v.ID == "" || m.files[v.ID] != "" || m.downloading[v.ID] || m.noVideoIDs[v.ID] {
+			continue
+		}
+		m.downloading[v.ID] = true
+		cmds = append(cmds, downloadCmd(m.cfg, v.ID, v.PageURL))
+	}
+	return m, cmds
+}
+
+// evictOutsideWindow deletes cached files for videos outside the current window.
+func (m *Model) evictOutsideWindow() {
+	keep := m.windowIDs()
+	for id, p := range m.files {
+		if !keep[id] {
+			_ = os.Remove(p)
+			delete(m.files, id)
+		}
+	}
 }
 
 // downloadTemp fetches a video to a fresh temp file, returning its path. The
@@ -96,110 +144,48 @@ func downloadTemp(ctx context.Context, ytdlp, pageURL string) (string, error) {
 	return tmp, nil
 }
 
-// beginPlayback starts the ffmpeg decoder (at the given fps) and (best-effort)
-// audio for a local file. Audio is best-effort: a headless box has no sound
-// device, but video still renders. The decoder and audio share the same file.
-func beginPlayback(cfg Config, path string, wPx, hPx, fps int) (*render.Decoder, *exec.Cmd, error) {
+// downloadCmd downloads a clip in the background, reporting a downloadDoneMsg.
+// Used for both the current video and prefetched neighbours; the cache dedupes.
+func downloadCmd(cfg Config, id, pageURL string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		path, err := downloadTemp(ctx, cfg.Ytdlp, pageURL)
+		return downloadDoneMsg{videoID: id, path: path, err: err}
+	}
+}
+
+// beginPlayback starts the ffmpeg decoder (at fps) and audio for a local file.
+func beginPlayback(cfg Config, path string, wPx, hPx, fps int) (*render.Decoder, *player.Audio, error) {
 	dec, err := render.StartDecode(cfg.FFmpeg, path, wPx, hPx, fps)
 	if err != nil {
 		return nil, nil, err
 	}
-	audio := player.AudioFileCmd(cfg.Mpv, path)
-	_ = audio.Start()
+	audio, _ := player.StartAudio(cfg.Mpv, path) // best-effort; nil-safe downstream
 	return dec, audio, nil
 }
 
-// startPlaybackCmd downloads the video to a temp file (yt-dlp supplies the
-// headers the CDN demands), then begins playback, reporting a playbackStartedMsg.
-func (m Model) startPlaybackCmd(gen int, v scraper.Video, wPx, hPx int) tea.Cmd {
-	cfg := m.cfg
-	fps := m.decodeFPS()
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
-		tmp, err := downloadTemp(ctx, cfg.Ytdlp, v.PageURL)
-		if err != nil {
-			if errors.Is(err, scraper.ErrNoVideo) {
-				return playbackStartedMsg{gen: gen, noVideo: true}
-			}
-			return playbackStartedMsg{gen: gen, err: err}
-		}
-		dec, audio, err := beginPlayback(cfg, tmp, wPx, hPx, fps)
-		if err != nil {
-			os.Remove(tmp)
-			return playbackStartedMsg{gen: gen, err: err}
-		}
-		return playbackStartedMsg{gen: gen, dec: dec, audio: audio, tmpPath: tmp}
-	}
-}
-
-// startFromFileCmd begins playback from an already-downloaded (prefetched) file.
+// startFromFileCmd begins playback from an already-downloaded (cached) file.
 func (m Model) startFromFileCmd(gen int, path string, wPx, hPx int) tea.Cmd {
 	cfg := m.cfg
 	fps := m.decodeFPS()
 	return func() tea.Msg {
 		dec, audio, err := beginPlayback(cfg, path, wPx, hPx, fps)
 		if err != nil {
-			os.Remove(path)
 			return playbackStartedMsg{gen: gen, err: err}
 		}
-		return playbackStartedMsg{gen: gen, dec: dec, audio: audio, tmpPath: path}
+		return playbackStartedMsg{gen: gen, dec: dec, audio: audio}
 	}
 }
 
-// restartDecodeCmd re-opens the decoder on an already-downloaded file to loop
-// playback (audio keeps looping independently in mpv). Reports a decoderReadyMsg.
+// restartDecodeCmd re-opens the decoder on a cached file to loop playback (audio
+// keeps looping independently in mpv). Reports a decoderReadyMsg.
 func (m Model) restartDecodeCmd(gen int, path string, wPx, hPx int) tea.Cmd {
 	cfg := m.cfg
 	fps := m.decodeFPS()
 	return func() tea.Msg {
 		dec, err := render.StartDecode(cfg.FFmpeg, path, wPx, hPx, fps)
 		return decoderReadyMsg{gen: gen, dec: dec, err: err}
-	}
-}
-
-// maybePrefetchNext kicks off a background download of the next clip if it isn't
-// already cached, in flight, or known to lack video. It evicts any stale
-// prefetched file so at most one upcoming clip is held on disk.
-func (m Model) maybePrefetchNext() (Model, tea.Cmd) {
-	ni := m.index + 1
-	if ni >= len(m.feed) {
-		return m, nil
-	}
-	next := m.feed[ni]
-	m.evictPrefetchExcept(next.ID)
-	if next.ID == "" || m.noVideoIDs[next.ID] || m.prefetching[next.ID] {
-		return m, nil
-	}
-	if _, ok := m.prefetched[next.ID]; ok {
-		return m, nil
-	}
-	m.prefetching[next.ID] = true
-	return m, m.prefetchCmd(next)
-}
-
-// prefetchCmd downloads v in the background, reporting a prefetchDoneMsg.
-func (m Model) prefetchCmd(v scraper.Video) tea.Cmd {
-	cfg := m.cfg
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		tmp, err := downloadTemp(ctx, cfg.Ytdlp, v.PageURL)
-		if err != nil {
-			return prefetchDoneMsg{videoID: v.ID, err: err}
-		}
-		return prefetchDoneMsg{videoID: v.ID, path: tmp}
-	}
-}
-
-// evictPrefetchExcept deletes every prefetched file except the one for keepID.
-func (m Model) evictPrefetchExcept(keepID string) {
-	for id, p := range m.prefetched {
-		if id != keepID {
-			_ = os.Remove(p)
-			delete(m.prefetched, id)
-		}
 	}
 }
 
