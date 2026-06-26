@@ -55,3 +55,23 @@ func (m PackageManager) Command(pkgs []string) []string {
 func (m PackageManager) CommandString(pkgs []string) string {
 	return strings.Join(m.Command(pkgs), " ")
 }
+
+// RefreshString is the command to refresh the package database, suggested when an
+// install fails on a stale db (notably Arch's "404 — file no longer on mirror").
+func (m PackageManager) RefreshString() string {
+	switch m.Name {
+	case "apt":
+		return "sudo apt-get update"
+	case "pacman":
+		return "sudo pacman -Syu"
+	case "dnf":
+		return "sudo dnf makecache"
+	case "zypper":
+		return "sudo zypper refresh"
+	case "apk":
+		return "sudo apk update"
+	case "brew":
+		return "brew update"
+	}
+	return ""
+}

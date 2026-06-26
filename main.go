@@ -157,7 +157,11 @@ func runSetup() int {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\ninstall failed: %v\n", err)
+		if r := mgr.RefreshString(); r != "" {
+			fmt.Fprintf(os.Stderr, "if that was a stale-database error (e.g. 404s on Arch),\n"+
+				"refresh your packages and re-run setup:\n  %s\n  lazytik setup\n", r)
+		}
 		return 1
 	}
 
