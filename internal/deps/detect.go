@@ -4,7 +4,6 @@ package deps
 
 import (
 	"os/exec"
-	"runtime"
 	"strings"
 )
 
@@ -54,19 +53,15 @@ func MissingRequired(statuses []Status) []string {
 	return missing
 }
 
-// InstallHint returns a platform-appropriate install command for the given
-// missing tool names, or "" if nothing is missing.
+// InstallHint returns the install command for the given missing tool names using
+// the host's detected package manager, or a manual fallback if none is found.
+// Returns "" if nothing is missing.
 func InstallHint(names []string) string {
 	if len(names) == 0 {
 		return ""
 	}
-	joined := strings.Join(names, " ")
-	switch runtime.GOOS {
-	case "darwin":
-		return "brew install " + joined
-	case "linux":
-		return "sudo apt install -y " + joined + "   # (or your distro's package manager)"
-	default:
-		return "install: " + joined
+	if m, ok := DetectManager(); ok {
+		return m.CommandString(names)
 	}
+	return "install manually: " + strings.Join(names, " ")
 }

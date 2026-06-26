@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -35,14 +36,20 @@ func main() {
 	if len(args) > 0 && args[0] == "doctor" {
 		os.Exit(runDoctor())
 	}
+	if len(args) > 0 && args[0] == "setup" {
+		os.Exit(runSetup())
+	}
 	_ = fs.Parse(args)
 	sources := fs.Args()
 
 	statuses := deps.Check()
 	if missing := deps.MissingRequired(statuses); len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "lazytik needs: %v\n", missing)
-		fmt.Fprintf(os.Stderr, "install them with:\n  %s\n\n", deps.InstallHint(missing))
-		fmt.Fprintln(os.Stderr, "run `lazytik doctor` for details.")
+		fmt.Fprintf(os.Stderr, "lazytik needs: %v\n\n", missing)
+		fmt.Fprintln(os.Stderr, "install them automatically:")
+		fmt.Fprintln(os.Stderr, "  lazytik setup")
+		if hint := deps.InstallHint(missing); hint != "" {
+			fmt.Fprintf(os.Stderr, "\nor manually:\n  %s\n", hint)
+		}
 		os.Exit(1)
 	}
 	if len(sources) == 0 {
@@ -74,6 +81,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage: lazytik [flags] @user [@user2 ...] | '#hashtag' | <url>...")
 	fmt.Fprintln(os.Stderr, "       lazytik --shuffle @a @b @c     # a mixed, FYP-like feed")
+	fmt.Fprintln(os.Stderr, "       lazytik setup                  # install missing deps")
 	fmt.Fprintln(os.Stderr, "       lazytik doctor")
 	fmt.Fprintln(os.Stderr, "\nflags:")
 	fmt.Fprintln(os.Stderr, "  --fullscreen   play via mpv handoff instead of the embedded pane")
@@ -120,6 +128,47 @@ func lookup(name string) string {
 	return name
 }
 
+// runSetup installs any missing dependencies using the host's package manager,
+// after showing the exact command and asking for confirmation.
+func runSetup() int {
+	missing := deps.MissingRequired(deps.Check())
+	if len(missing) == 0 {
+		fmt.Println("✓ all dependencies are already installed.")
+		return 0
+	}
+	fmt.Printf("missing: %s\n", strings.Join(missing, " "))
+
+	mgr, ok := deps.DetectManager()
+	if !ok {
+		fmt.Println("couldn't detect a supported package manager.")
+		fmt.Printf("install these manually: %s\n", strings.Join(missing, " "))
+		return 1
+	}
+
+	argv := mgr.Command(missing)
+	fmt.Printf("\nwill run (%s):\n  %s\n\nproceed? [y/N] ", mgr.Name, strings.Join(argv, " "))
+	var resp string
+	fmt.Scanln(&resp)
+	if r := strings.ToLower(strings.TrimSpace(resp)); r != "y" && r != "yes" {
+		fmt.Println("aborted.")
+		return 1
+	}
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
+		return 1
+	}
+
+	if still := deps.MissingRequired(deps.Check()); len(still) > 0 {
+		fmt.Printf("still missing: %s — see `lazytik doctor`.\n", strings.Join(still, " "))
+		return 1
+	}
+	fmt.Println("\n✓ all set — run `lazytik @username` to start.")
+	return 0
+}
+
 // runDoctor prints dependency status and returns a process exit code.
 func runDoctor() int {
 	fmt.Println("lazytik doctor — external dependencies:")
@@ -143,7 +192,8 @@ func runDoctor() int {
 	}
 
 	if hint := deps.InstallHint(deps.MissingRequired(statuses)); hint != "" {
-		fmt.Printf("\ninstall missing tools with:\n  %s\n", hint)
+		fmt.Printf("\ninstall automatically:  lazytik setup\n")
+		fmt.Printf("or manually:            %s\n", hint)
 		return 1
 	}
 	fmt.Println("\nall set — lazytik is ready to roll.")
