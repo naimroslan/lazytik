@@ -70,7 +70,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.nextFrameCmd(m.gen, m.dec)
 
 	case frameReadyMsg:
-		if msg.gen != m.gen {
+		if msg.gen != m.gen || m.dec == nil {
 			return m, nil
 		}
 		m.frame = msg.content

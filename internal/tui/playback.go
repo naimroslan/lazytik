@@ -75,8 +75,7 @@ func (m Model) startCurrent() (Model, tea.Cmd) {
 		return m.skipForward("no video in this post")
 	}
 
-	m.stopPlayback()
-	m.gen++
+	m.stopPlayback() // bumps gen, invalidating stale frames
 	m.paused = false
 	m.evictOutsideWindow()
 

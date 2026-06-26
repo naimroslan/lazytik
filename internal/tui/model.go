@@ -124,7 +124,9 @@ func (m Model) current() (scraper.Video, bool) {
 }
 
 // stopPlayback tears down the current decoder and audio, leaving the cached files
-// in place so navigating back is instant.
+// in place so navigating back is instant. It bumps the playback epoch so any
+// in-flight frame/decoder messages for the old clip are discarded (without this,
+// a stale frameReadyMsg arriving after dec is nil would nil-deref).
 func (m *Model) stopPlayback() {
 	if m.dec != nil {
 		_ = m.dec.Close()
@@ -133,6 +135,7 @@ func (m *Model) stopPlayback() {
 	m.audio.Close()
 	m.audio = nil
 	m.frame = ""
+	m.gen++
 }
 
 // cleanupAll tears down playback and removes every cached file. Called on quit.

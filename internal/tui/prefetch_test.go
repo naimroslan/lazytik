@@ -76,6 +76,17 @@ func TestNavSettledStaleIgnored(t *testing.T) {
 	}
 }
 
+// Regression: a stale frame arriving after navigation (decoder torn down) must
+// not schedule another read — that read would nil-deref and panic the program.
+func TestFrameReadyNilDecoderNoPanic(t *testing.T) {
+	m := loaded()
+	m.dec = nil
+	_, cmd := m.Update(frameReadyMsg{gen: m.gen, content: "x"})
+	if cmd != nil {
+		t.Error("frameReadyMsg with nil decoder must not schedule another frame")
+	}
+}
+
 func TestPrefetchWindowMarksNeighbours(t *testing.T) {
 	m := newTestModel("a", "b", "c", "d")
 	m.index = 1 // window neighbours: c(+1)... a(-1), d(+2)
