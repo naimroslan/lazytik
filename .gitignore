@@ -1,0 +1,5 @@
+# compiled binary
+/lazytik
+# go build/test artifacts
+*.out
+*.test
