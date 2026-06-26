@@ -188,8 +188,12 @@ func (m Model) restartDecodeCmd(gen int, path string, wPx, hPx int) tea.Cmd {
 	}
 }
 
-// nextFrameCmd reads and renders one frame for the given playback epoch.
+// nextFrameCmd reads and renders one frame for the given playback epoch. Returns
+// nil if there is no decoder, so no caller can schedule a read on a nil decoder.
 func (m Model) nextFrameCmd(gen int, dec *render.Decoder) tea.Cmd {
+	if dec == nil {
+		return nil
+	}
 	renderer := m.renderer
 	return func() tea.Msg {
 		buf, err := dec.Next()

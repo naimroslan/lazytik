@@ -13,10 +13,11 @@ import (
 // slideshow post that yt-dlp exposes as audio-only). Callers should skip it.
 var ErrNoVideo = errors.New("post has no video stream")
 
-// videoFormat prefers a combined stream that already carries video+audio, capped
-// at 720p (plenty for half-block rendering and faster to fetch); falls back to
-// any format that has video. Audio-only posts match nothing → yt-dlp errors.
-const videoFormat = "best[vcodec!=none][height<=720]/best[vcodec!=none]/bv*[height<=720]+ba"
+// videoFormat always pairs video with an audio track (merging when TikTok serves
+// them separately, which otherwise yields silent clips), capped at 720p where
+// possible. Every branch requires video, so audio-only photo posts match nothing
+// → yt-dlp errors → ErrNoVideo → the post is skipped.
+const videoFormat = "bv*[height<=720]+ba/b[vcodec!=none][height<=720]/bv*+ba/b[vcodec!=none]"
 
 // ytEntry mirrors the subset of yt-dlp's JSON we consume. Flat-playlist mode
 // already returns uploader/like_count/description for TikTok, so listing a feed
