@@ -12,9 +12,24 @@ import (
 	"github.com/naimroslan/lazytik/internal/scraper"
 )
 
-// chromeRows is the number of rows the header, caption, status and footer take,
-// leaving the rest for the video pane.
-const chromeRows = 6
+// chromeRows is the number of rows the non-video parts take in the single-column
+// layout, leaving the rest for the video pane: 2 pane borders + CAPTION divider +
+// info line + caption + COMMENTS divider + placeholder + footer, plus one slack
+// row for the optional status line.
+const chromeRows = 9
+
+// twoColChromeRows is the vertical chrome in the two-column layout: the status
+// line, footer, and the pane's two border rows. The caption/comments live in the
+// side column, so they no longer cost vertical rows.
+const twoColChromeRows = 4
+
+// twoColMinWidth is the terminal width at or above which the side-by-side desktop
+// layout (video | caption/comments) is used; narrower terminals stack vertically.
+const twoColMinWidth = 80
+
+// sideMinW is the minimum inner width reserved for the right (caption/comments)
+// column in the two-column layout.
+const sideMinW = 24
 
 // kittyMaxFPS caps the frame rate for the kitty backend: each frame is a whole
 // (compressed) image, so a high rate can't be sustained over a link and the
@@ -33,9 +48,38 @@ func (m Model) decodeFPS() int {
 	return m.cfg.FPS
 }
 
+// useTwoColumn reports whether to render the side-by-side desktop layout (video
+// on the left, caption/comments on the right). It is excluded for the kitty
+// renderer: a kitty frame is a graphics escape that lipgloss can't measure or
+// JoinHorizontal beside a text column (View places it with C=1 and reserves rows
+// by hand), so kitty keeps the single-column stack. The owner runs half-blocks
+// (Termius/iOS), so this costs nothing in practice.
+func (m Model) useTwoColumn() bool {
+	return m.width >= twoColMinWidth && m.renderer.Name() != "kitty"
+}
+
 // paneCells returns the size, in character cells, of the video pane's content
-// area. Shared by the view (to draw) and playback (to size the decoder).
+// area. Shared by the view (to draw) and playback (to size the decoder), so both
+// agree on the dimensions the decoder renders frames to.
 func (m Model) paneCells() (cols, rows int) {
+	if m.useTwoColumn() {
+		rows = m.height - twoColChromeRows
+		if rows < 3 {
+			rows = 3
+		}
+		// Terminal cells are ~1:2 (w:h), so a visually-square pane needs about
+		// twice as many columns as rows. Clamp so the right column keeps at least
+		// sideMinW inner columns. The two bordered boxes consume 4 border columns
+		// total, so usable content columns = width-4 split between pane and side.
+		cols = 2 * rows
+		if max := m.width - sideMinW - 4; cols > max {
+			cols = max
+		}
+		if cols < 10 {
+			cols = 10
+		}
+		return cols, rows
+	}
 	cols = m.width - 2 // pane border columns
 	if cols < 10 {
 		cols = 10
